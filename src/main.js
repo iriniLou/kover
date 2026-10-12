@@ -1,18 +1,21 @@
 // Kover — ковёр, который лежит на рабочем столе и прячет под собой папки и файлы.
+// На каждом мониторе — прозрачный слой во весь экран; ковры рисуются в нём,
+// а клики мимо ковра проходят насквозь к рабочему столу.
 const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, dialog, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
-const RUG_ASPECT = 1514 / 786; // пропорции картинки ковра (ширина / высота)
-const PAD = 36; // запас под тень вокруг ковра
-const MIN_WIDTH = 160;
-const MAX_WIDTH = 3000;
+const RUG_ASPECT = 1514 / 786;
 const DEFAULT_WIDTH = 560;
 
 const isMac = process.platform === 'darwin';
 const ru = () => (app.getLocale() || '').toLowerCase().startsWith('ru')
   || (app.getPreferredSystemLanguages?.() || []).some((l) => l.toLowerCase().startsWith('ru'));
 const t = (r, e) => (ru() ? r : e);
+
+// WebGL нужен всегда: если видеокарта в «чёрном списке», рисуем программно
+app.commandLine.appendSwitch('ignore-gpu-blocklist');
+app.commandLine.appendSwitch('enable-unsafe-swiftshader');
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -36,78 +39,56 @@ function loadState() {
 
 function saveState() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(saveNow, 400);
+  saveTimer = setTimeout(saveNow, 300);
 }
 
 function saveNow() {
   clearTimeout(saveTimer);
-  for (const [id, w] of wins) {
-    const rug = state.rugs.find((r) => r.id === id);
-    if (rug && !w.isDestroyed()) {
-      const b = w.getBounds();
-      rug.cx = Math.round(b.x + b.width / 2);
-      rug.cy = Math.round(b.y + b.height / 2);
-    }
-  }
   try {
     fs.mkdirSync(path.dirname(statePath()), { recursive: true });
-    fs.writeFileSync(statePath(), JSON.stringify(state, null, 2));
+    fs.writeFileSync(statePath(), JSON.stringify(state));
   } catch (e) {
     console.error('save failed', e);
   }
 }
 
-const clampWidth = (w) => Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, Math.round(w)));
-const rugHeight = (w) => Math.round(w / RUG_ASPECT);
-const sideFor = (w) => Math.ceil(Math.hypot(w, rugHeight(w))) + PAD * 2;
+const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
-function centerOnScreen(rug) {
-  const pt = { x: Math.round(rug.cx), y: Math.round(rug.cy) };
-  return screen.getAllDisplays().some((d) => {
-    const b = d.bounds;
-    return pt.x >= b.x && pt.x < b.x + b.width && pt.y >= b.y && pt.y < b.y + b.height;
-  });
-}
-
-function newRug(offset = 0) {
-  const wa = screen.getPrimaryDisplay().workArea;
+function newRugSpec(display, offset = 0) {
+  const wa = display.workArea;
   return {
-    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-    cx: Math.round(wa.x + wa.width / 2 + offset),
-    cy: Math.round(wa.y + wa.height / 2 + offset),
-    angle: 0,
+    id: newId(),
+    display: display.id,
     width: Math.min(DEFAULT_WIDTH, Math.round(wa.width * 0.6)),
+    cx: Math.round(wa.width / 2 + offset),
+    cy: Math.round(wa.height / 2 + offset),
+    angle: 0,
   };
 }
 
-// ---------- окна-ковры ----------
-const wins = new Map(); // id -> BrowserWindow
-let drag = null; // { win, timer, startCursor, startPos }
+// ---------- слои (по одному на монитор) ----------
+const overlays = new Map(); // display.id -> BrowserWindow
 
-function boundsFor(rug) {
-  const side = sideFor(rug.width);
-  return {
-    x: Math.round(rug.cx - side / 2),
-    y: Math.round(rug.cy - side / 2),
-    width: side,
-    height: side,
-  };
-}
-
-function createRugWindow(rug) {
+function createOverlay(display) {
+  const wa = display.workArea;
   const win = new BrowserWindow({
-    ...boundsFor(rug),
+    x: wa.x,
+    y: wa.y,
+    width: wa.width,
+    height: wa.height,
     frame: false,
     transparent: true,
     backgroundColor: '#00000000',
     hasShadow: false,
     resizable: false,
+    movable: false,
     minimizable: false,
     maximizable: false,
     fullscreenable: false,
     skipTaskbar: true,
     enableLargerThanScreen: true,
     roundedCorners: false,
+    type: process.platform === 'win32' ? 'toolbar' : undefined,
     show: false,
     title: 'Kover',
     webPreferences: {
@@ -118,138 +99,128 @@ function createRugWindow(rug) {
       spellcheck: false,
     },
   });
-  win.rugId = rug.id;
+  win.displayId = display.id;
   win.setIgnoreMouseEvents(true, { forward: true });
   if (isMac) win.setVisibleOnAllWorkspaces(true);
   win.loadFile(path.join(__dirname, 'index.html'));
   win.once('ready-to-show', () => {
+    win.setBounds(wa);
     if (!state.hidden) win.showInactive();
   });
-  win.on('closed', () => wins.delete(rug.id));
-  wins.set(rug.id, win);
+  win.on('closed', () => {
+    if (overlays.get(display.id) === win) overlays.delete(display.id);
+  });
+  overlays.set(display.id, win);
   return win;
 }
 
-function rugOf(event) {
-  const win = BrowserWindow.fromWebContents(event.sender);
-  if (!win) return {};
-  return { win, rug: state.rugs.find((r) => r.id === win.rugId) };
-}
-
-function sendRug(win, rug) {
-  if (!win || win.isDestroyed()) return;
-  win.webContents.send('rug:set', { width: rug.width, height: rugHeight(rug.width), angle: rug.angle });
-}
-
-function resizeRug(win, rug, width) {
-  const b = win.getBounds();
-  rug.cx = b.x + b.width / 2;
-  rug.cy = b.y + b.height / 2;
-  rug.width = clampWidth(width);
-  win.setBounds(boundsFor(rug));
-  sendRug(win, rug);
+function buildOverlays() {
+  for (const w of overlays.values()) if (!w.isDestroyed()) w.destroy();
+  overlays.clear();
+  const displays = screen.getAllDisplays();
+  const primary = screen.getPrimaryDisplay();
+  // ковры с отключённых мониторов переезжают на основной
+  for (const r of state.rugs) {
+    if (!displays.some((d) => d.id === r.display)) {
+      r.display = primary.id;
+      delete r.pos;
+      r.cx = Math.round(primary.workArea.width / 2);
+      r.cy = Math.round(primary.workArea.height / 2);
+    }
+  }
+  for (const d of displays) createOverlay(d);
   saveState();
 }
 
-function setAngle(win, rug, angle) {
-  rug.angle = ((angle % 360) + 360) % 360;
-  sendRug(win, rug);
-  saveState();
+let displayTimer = null;
+let displayKey = '';
+const currentDisplayKey = () => screen.getAllDisplays()
+  .map((d) => `${d.id}:${d.workArea.x},${d.workArea.y},${d.workArea.width},${d.workArea.height}`).join('|');
+
+function onDisplaysChanged() {
+  clearTimeout(displayTimer);
+  displayTimer = setTimeout(() => {
+    const key = currentDisplayKey();
+    if (key === displayKey) return;
+    displayKey = key;
+    buildOverlays();
+  }, 800);
 }
 
+const overlayOf = (e) => BrowserWindow.fromWebContents(e.sender);
+const send = (win, msg) => win && !win.isDestroyed() && win.webContents.send('ov:action', msg);
+
+ipcMain.handle('ov:init', (e) => {
+  const win = overlayOf(e);
+  const id = win?.displayId;
+  let image = null;
+  try {
+    image = 'data:image/jpeg;base64,' + fs.readFileSync(path.join(__dirname, 'rug.jpg')).toString('base64');
+  } catch {
+    image = null;
+  }
+  return { image, rugs: state.rugs.filter((r) => r.display === id) };
+});
+
+ipcMain.on('ov:save', (e, rugs) => {
+  const win = overlayOf(e);
+  if (!win || !Array.isArray(rugs)) return;
+  const id = win.displayId;
+  state.rugs = state.rugs.filter((r) => r.display !== id).concat(rugs.map((r) => ({ ...r, display: id })));
+  saveState();
+  rebuildTray();
+});
+
+ipcMain.on('ov:ignore', (e, ignore) => {
+  const win = overlayOf(e);
+  if (win) win.setIgnoreMouseEvents(!!ignore, { forward: true });
+});
+
+ipcMain.on('ov:menu', (e, rugId) => {
+  const win = overlayOf(e);
+  if (!win) return;
+  rugMenu(win, rugId).popup({ window: win });
+});
+
+// ---------- действия ----------
 function addRug() {
-  const rug = newRug(state.rugs.length ? 40 * (state.rugs.length % 6) : 0);
-  state.rugs.push(rug);
-  state.hidden = false;
-  showAll();
-  createRugWindow(rug);
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  const count = state.rugs.filter((r) => r.display === display.id).length;
+  const spec = newRugSpec(display, 40 * (count % 6));
+  state.rugs.push(spec);
+  if (state.hidden) showAll();
+  send(overlays.get(display.id), { action: 'add', value: spec });
   saveState();
   rebuildTray();
 }
 
-function removeRug(id) {
-  state.rugs = state.rugs.filter((r) => r.id !== id);
-  const w = wins.get(id);
-  if (w && !w.isDestroyed()) w.destroy();
+function moveToDisplay(win, rugId, display) {
+  const rug = state.rugs.find((r) => r.id === rugId);
+  if (!rug || display.id === win.displayId) return;
+  send(win, { id: rugId, action: 'remove' });
+  const spec = { ...newRugSpec(display), id: newId(), width: rug.width, angle: rug.angle || 0 };
+  state.rugs = state.rugs.filter((r) => r.id !== rugId).concat(spec);
+  send(overlays.get(display.id), { action: 'add', value: spec });
   saveState();
-  rebuildTray();
 }
 
 function showAll() {
   state.hidden = false;
-  for (const w of wins.values()) if (!w.isDestroyed()) w.showInactive();
+  for (const w of overlays.values()) if (!w.isDestroyed()) w.showInactive();
   saveState();
   rebuildTray();
 }
 
 function hideAll() {
   state.hidden = true;
-  for (const w of wins.values()) if (!w.isDestroyed()) w.hide();
+  for (const w of overlays.values()) if (!w.isDestroyed()) w.hide();
   saveState();
   rebuildTray();
 }
 
-// ---------- перетаскивание (двигаем окно вслед за курсором) ----------
-function stopDrag() {
-  if (!drag) return;
-  clearInterval(drag.timer);
-  drag = null;
-  saveState();
-}
-
-ipcMain.on('rug:drag-start', (e) => {
-  const { win } = rugOf(e);
-  if (!win) return;
-  stopDrag();
-  const [x, y] = win.getPosition();
-  const c = screen.getCursorScreenPoint();
-  drag = { win, startCursor: c, startPos: { x, y } };
-  drag.timer = setInterval(() => {
-    if (!drag || drag.win.isDestroyed()) return stopDrag();
-    const p = screen.getCursorScreenPoint();
-    const nx = drag.startPos.x + p.x - drag.startCursor.x;
-    const ny = drag.startPos.y + p.y - drag.startCursor.y;
-    const [cx, cy] = drag.win.getPosition();
-    if (cx !== nx || cy !== ny) drag.win.setPosition(nx, ny, false);
-  }, 8);
-});
-
-ipcMain.on('rug:drag-end', () => stopDrag());
-
-ipcMain.on('rug:ignore', (e, ignore) => {
-  const { win } = rugOf(e);
-  if (win) win.setIgnoreMouseEvents(!!ignore, { forward: true });
-});
-
-ipcMain.on('rug:ready', (e) => {
-  const { win, rug } = rugOf(e);
-  if (win && rug) sendRug(win, rug);
-});
-
-ipcMain.on('rug:angle', (e, angle) => {
-  const { rug } = rugOf(e);
-  if (!rug || !Number.isFinite(angle)) return;
-  rug.angle = ((angle % 360) + 360) % 360;
-  saveState();
-});
-
-ipcMain.on('rug:zoom', (e, factor) => {
-  const { win, rug } = rugOf(e);
-  if (!win || !rug || !Number.isFinite(factor)) return;
-  resizeRug(win, rug, rug.width * factor);
-});
-
-ipcMain.on('rug:menu', (e) => {
-  const { win, rug } = rugOf(e);
-  if (!win || !rug) return;
-  stopDrag();
-  rugMenu(win, rug).popup({ window: win });
-});
-
-// ---------- меню ----------
 function sizesFor(win) {
-  const wa = screen.getDisplayMatching(win.getBounds()).workArea;
-  const full = Math.min(wa.width * 0.94, wa.height * 0.94 * RUG_ASPECT);
+  const wa = screen.getAllDisplays().find((d) => d.id === win.displayId)?.workArea || screen.getPrimaryDisplay().workArea;
+  const full = Math.round(Math.min(wa.width * 0.94, wa.height * 0.94 * RUG_ASPECT));
   return [
     [t('Маленький', 'Small'), 320],
     [t('Средний', 'Medium'), 560],
@@ -258,28 +229,45 @@ function sizesFor(win) {
   ];
 }
 
-function rugMenu(win, rug) {
-  return Menu.buildFromTemplate([
-    { label: t('Повернуть на 90°', 'Rotate 90°'), click: () => setAngle(win, rug, Math.round(rug.angle / 90) * 90 + 90) },
-    { label: t('Положить ровно', 'Straighten'), click: () => setAngle(win, rug, 0) },
+function rugMenu(win, rugId) {
+  const act = (action, value) => () => send(win, { id: rugId, action, value });
+  const rug = state.rugs.find((r) => r.id === rugId);
+  const displays = screen.getAllDisplays();
+  const items = [
+    { label: t('Расправить', 'Smooth out'), click: act('straighten') },
+    { label: t('Положить ровно', 'Straighten'), click: act('level') },
+    { label: t('Повернуть на 90°', 'Rotate 90°'), click: act('rotate90') },
     {
       label: t('Размер', 'Size'),
       submenu: [
-        ...sizesFor(win).map(([label, w]) => ({ label, click: () => resizeRug(win, rug, w) })),
+        ...sizesFor(win).map(([label, w]) => ({ label, click: act('size', w) })),
         { type: 'separator' },
-        { label: t('Больше', 'Bigger'), click: () => resizeRug(win, rug, rug.width * 1.15) },
-        { label: t('Меньше', 'Smaller'), click: () => resizeRug(win, rug, rug.width / 1.15) },
+        { label: t('Больше', 'Bigger'), click: act('size', Math.min(3000, Math.round((rug?.width || DEFAULT_WIDTH) * 1.2))) },
+        { label: t('Меньше', 'Smaller'), click: act('size', Math.max(160, Math.round((rug?.width || DEFAULT_WIDTH) / 1.2))) },
       ],
     },
+  ];
+  if (displays.length > 1) {
+    items.push({
+      label: t('Перенести на другой экран', 'Move to another display'),
+      submenu: displays.map((d, i) => ({
+        label: `${t('Экран', 'Display')} ${i + 1}${d.id === win.displayId ? ' ✓' : ''}`,
+        enabled: d.id !== win.displayId,
+        click: () => moveToDisplay(win, rugId, d),
+      })),
+    });
+  }
+  items.push(
     { type: 'separator' },
     { label: t('Постелить ещё один ковёр', 'Add another rug'), click: addRug },
-    { label: t('Убрать этот ковёр', 'Remove this rug'), click: () => removeRug(rug.id) },
+    { label: t('Убрать этот ковёр', 'Remove this rug'), click: act('remove') },
     { label: t('Спрятать все ковры', 'Hide all rugs'), click: hideAll },
     { type: 'separator' },
     loginItem(),
     { label: t('Как пользоваться…', 'How to use…'), click: showHelp },
     { label: t('Выйти', 'Quit'), click: () => app.quit() },
-  ]);
+  );
+  return Menu.buildFromTemplate(items);
 }
 
 function loginItem() {
@@ -295,16 +283,20 @@ function loginItem() {
 }
 
 const helpText = () => t(
-  '• Тяни ковёр мышкой — он переедет.\n'
-  + '• Потяни за уголок — ковёр загнётся, можно подглядеть, что под ним.\n'
-  + '• Колесо мыши / два пальца на тачпаде над ковром — повернуть.\n'
-  + '• Ctrl или ⌘ + колесо (или щипок на тачпаде) — сделать больше/меньше.\n'
-  + '• Правая кнопка по ковру — меню: размер, ещё ковёр, убрать.\n'
-  + '• Значок ковра в ' + (isMac ? 'строке меню вверху' : 'трее у часов') + ' — показать/спрятать ковры и выйти.',
-  '• Drag the rug to move it.\n'
-  + '• Drag a corner to fold it and peek underneath.\n'
-  + '• Scroll over the rug to rotate it.\n'
-  + '• Ctrl/⌘ + scroll (or pinch) to resize.\n'
+  '• Возьми ковёр за середину и тащи — он переедет целиком.\n'
+  + '• Потяни за край или уголок — ковёр задерётся и сомнётся складками. '
+  + 'Отпустишь — так и останется мятым.\n'
+  + '• С зажатым ' + (isMac ? '⌥ Option' : 'Alt') + ' можно мять за любое место.\n'
+  + '• Двойной клик по ковру — расправить.\n'
+  + '• Колесо мыши / два пальца на тачпаде — повернуть.\n'
+  + '• ' + (isMac ? '⌘' : 'Ctrl') + ' + колесо (или щипок на тачпаде) — больше/меньше.\n'
+  + '• Правая кнопка по ковру — меню: расправить, размер, ещё ковёр, убрать.\n'
+  + '• Значок ковра ' + (isMac ? 'в строке меню вверху' : 'в трее у часов') + ' — показать/спрятать ковры и выйти.',
+  '• Drag the middle of the rug to move it.\n'
+  + '• Pull an edge or a corner to lift and crumple it. It stays crumpled.\n'
+  + '• Hold ' + (isMac ? '⌥ Option' : 'Alt') + ' to crumple from anywhere.\n'
+  + '• Double-click to smooth it out.\n'
+  + '• Scroll to rotate; ' + (isMac ? '⌘' : 'Ctrl') + ' + scroll (or pinch) to resize.\n'
   + '• Right-click the rug for more options.\n'
   + '• Use the rug icon in the ' + (isMac ? 'menu bar' : 'system tray') + ' to show/hide rugs or quit.',
 );
@@ -329,8 +321,8 @@ function rebuildTray() {
       ? { label: t('Показать ковры', 'Show rugs'), click: () => (state.rugs.length ? showAll() : addRug()) }
       : { label: t('Спрятать ковры', 'Hide rugs'), click: hideAll },
     {
-      label: t('Положить все ровно', 'Straighten all'),
-      click: () => state.rugs.forEach((r) => setAngle(wins.get(r.id), r, 0)),
+      label: t('Расправить все и положить ровно', 'Smooth & straighten all'),
+      click: () => overlays.forEach((w) => send(w, { action: 'straighten-all' })),
     },
     { type: 'separator' },
     loginItem(),
@@ -358,7 +350,7 @@ app.on('second-instance', () => {
 });
 
 app.on('window-all-closed', () => {
-  // живём в трее, даже если все ковры убраны
+  // живём в трее, даже если окна пересоздаются
 });
 
 app.on('before-quit', saveNow);
@@ -367,22 +359,19 @@ app.whenReady().then(() => {
   if (isMac && app.dock) app.dock.hide();
   const firstRun = !loadState();
   state.rugs = state.rugs.filter((r) => r && r.id && Number.isFinite(r.width));
-  if (firstRun || !state.rugs.length) state.rugs = [newRug()];
-  for (const rug of state.rugs) {
-    rug.width = clampWidth(rug.width);
-    rug.angle = Number.isFinite(rug.angle) ? rug.angle : 0;
-    if (!centerOnScreen(rug)) Object.assign(rug, { cx: newRug().cx, cy: newRug().cy });
-    createRugWindow(rug);
-  }
+  const primary = screen.getPrimaryDisplay();
+  if (firstRun || !state.rugs.length) state.rugs = [newRugSpec(primary)];
+  displayKey = currentDisplayKey();
+  buildOverlays();
   createTray();
-  saveState();
-  if (firstRun) {
-    if (Notification.isSupported()) {
-      new Notification({
-        title: t('Ковёр постелен', 'Rug is down'),
-        body: t('Тяни мышкой, крути колесом, загибай уголок. Правая кнопка — меню.',
-          'Drag it, scroll to rotate, pull a corner to peek. Right-click for menu.'),
-      }).show();
-    }
+  screen.on('display-added', onDisplaysChanged);
+  screen.on('display-removed', onDisplaysChanged);
+  screen.on('display-metrics-changed', onDisplaysChanged);
+  if (firstRun && Notification.isSupported()) {
+    new Notification({
+      title: t('Ковёр постелен', 'Rug is down'),
+      body: t('Тащи за середину, мни за края, двойной клик — расправить. Правая кнопка — меню.',
+        'Drag the middle, crumple the edges, double-click to smooth. Right-click for menu.'),
+    }).show();
   }
 });

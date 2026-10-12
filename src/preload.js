@@ -1,12 +1,9 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('kover', {
-  ready: () => ipcRenderer.send('rug:ready'),
-  ignoreMouse: (ignore) => ipcRenderer.send('rug:ignore', ignore),
-  dragStart: () => ipcRenderer.send('rug:drag-start'),
-  dragEnd: () => ipcRenderer.send('rug:drag-end'),
-  setAngle: (deg) => ipcRenderer.send('rug:angle', deg),
-  zoom: (factor) => ipcRenderer.send('rug:zoom', factor),
-  menu: () => ipcRenderer.send('rug:menu'),
-  onSet: (cb) => ipcRenderer.on('rug:set', (_e, data) => cb(data)),
+  init: () => ipcRenderer.invoke('ov:init'),
+  save: (rugs) => ipcRenderer.send('ov:save', rugs),
+  ignoreMouse: (ignore) => ipcRenderer.send('ov:ignore', ignore),
+  menu: (id) => ipcRenderer.send('ov:menu', id),
+  onAction: (cb) => ipcRenderer.on('ov:action', (_e, msg) => cb(msg)),
 });

@@ -1,7 +1,7 @@
 {
   "name": "kover",
   "productName": "Kover",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Ковёр для рабочего стола: прячет бардак из папок и файлов",
   "main": "src/main.js",
   "author": "irinilou",
