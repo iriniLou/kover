@@ -1,0 +1,47 @@
+{
+  "name": "kover",
+  "productName": "Kover",
+  "version": "1.0.0",
+  "description": "Ковёр для рабочего стола: прячет бардак из папок и файлов",
+  "main": "src/main.js",
+  "author": "irinilou",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist:mac": "electron-builder --mac --universal --publish never",
+    "dist:win": "electron-builder --win --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "42.11.6",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.irinilou.kover",
+    "productName": "Kover",
+    "artifactName": "Kover-${version}-${os}.${ext}",
+    "files": ["src/**/*", "assets/**/*", "package.json"],
+    "directories": { "buildResources": "build", "output": "dist" },
+    "mac": {
+      "target": ["dmg"],
+      "category": "public.app-category.utilities",
+      "icon": "build/icon.png",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "extendInfo": { "LSUIElement": true }
+    },
+    "dmg": {
+      "title": "Kover"
+    },
+    "win": {
+      "target": ["nsis"],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "runAfterFinish": true,
+      "artifactName": "Kover-Setup-${version}.${ext}"
+    }
+  }
+}
