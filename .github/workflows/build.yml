@@ -3,7 +3,6 @@ name: Build
 on:
   push:
     branches: [master, main]
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -36,8 +35,21 @@ jobs:
         with:
           name: kover-${{ runner.os }}
           path: ${{ matrix.files }}
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "v=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.v }}
+          name: Kover ${{ steps.ver.outputs.v }}
+          target_commitish: ${{ github.sha }}
           files: ${{ matrix.files }}
+          body: |
+            Ковёр для рабочего стола.
+            - **Mac:** скачайте `Kover-${{ steps.ver.outputs.v }}-mac.dmg`
+            - **Windows:** скачайте `Kover-Setup-${{ steps.ver.outputs.v }}.exe`
+
+            Как открыть неподписанную программу — см. README.

@@ -49,6 +49,6 @@ npm run dist:win   # собрать .exe (на Windows)
 ```
 
 Сборки для обеих систем делаются автоматически в GitHub Actions
-(`.github/workflows/build.yml`); при пуше тега `v*` файлы прикрепляются к релизу.
+(`.github/workflows/build.yml`); при пуше в `master` файлы прикрепляются к релизу с номером версии из `package.json`.
 
 Картинку ковра можно заменить: `src/rug.jpg` (пропорции задаются в `src/main.js`, `RUG_ASPECT`).
