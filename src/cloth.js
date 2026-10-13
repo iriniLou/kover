@@ -31,13 +31,22 @@
           this.uv[k * 2 + 1] = j / (ny - 1);
         }
       }
-      this.bend = 0.05; // жёсткость на изгиб
+      this.bend = 0.5; // жёсткость на изгиб: ковёр толстый, гнётся мягкими волнами
+      this.restXY = new Float32Array(n * 2);
+      for (let k = 0; k < n; k++) {
+        const i = k % nx;
+        const j = (k / nx) | 0;
+        this.restXY[k * 2] = i * this.sx - width / 2;
+        this.restXY[k * 2 + 1] = j * this.sy - height / 2;
+      }
+      // сколько ковёр может «собраться» у руки, прежде чем поедет целиком
+      this.slack = Math.min(width, height) * 0.16;
+      this.inertia = (width * width + height * height) / 12;
       this.settle = 1; // 1 — свободно движется, 0 — замер
       this.buildConstraints();
       this.buildIndices();
       this.pinned = -1;
       this.pinTarget = [0, 0, 0];
-      this.lra = null;
       this.rng = 1;
       this.grip = 0.06; // насколько легко сдвинуть лежащую на полу часть
       this.friction = 0.35; // доля сдвига по полу, которая «проскальзывает»
@@ -64,7 +73,7 @@
         const b = this.idx(i2, j2);
         const [ax, ay] = this.restPos(a);
         const [bx, by] = this.restPos(b);
-        list.push([a, b, Math.hypot(ax - bx, ay - by), stiff < 0 ? this.bend : stiff]);
+        list.push([a, b, Math.hypot(ax - bx, ay - by), stiff === -1 ? this.bend : stiff === -2 ? this.bend * 0.5 : stiff]);
       };
       for (let j = 0; j < ny; j++) {
         for (let i = 0; i < nx; i++) {
@@ -72,8 +81,10 @@
           add(i, j, i, j + 1, 1);
           add(i, j, i + 1, j + 1, 0.9); // сдвиг
           add(i + 1, j, i, j + 1, 0.9);
-          add(i, j, i + 2, j, -1); // изгиб: ковёр толстый, складки мягкие
+          add(i, j, i + 2, j, -1); // изгиб
           add(i, j, i, j + 2, -1);
+          add(i, j, i + 4, j, -2); // широкий изгиб: без мелких заломов
+          add(i, j, i, j + 4, -2);
         }
       }
       const m = list.length;
@@ -180,14 +191,6 @@
     pin(k, x, y, z) {
       this.pinned = k;
       this.pinTarget = [x, y, z];
-      // «длинные связи»: никакая точка не может уйти от схваченной дальше,
-      // чем по ковру, — так ковёр не растягивается, а едет следом
-      this.lra = new Float32Array(this.n);
-      const [px, py] = this.restPos(k);
-      for (let q = 0; q < this.n; q++) {
-        const [qx, qy] = this.restPos(q);
-        this.lra[q] = Math.hypot(px - qx, py - qy);
-      }
     }
 
     movePin(x, y, z) {
@@ -196,7 +199,82 @@
 
     unpin() {
       this.pinned = -1;
-      this.lra = null;
+    }
+
+    // положение ковра «как целого»: центр и угол, лучше всего подходящие к точкам
+    frame() {
+      const { pos, restXY, n } = this;
+      let cx = 0;
+      let cy = 0;
+      for (let k = 0; k < n; k++) {
+        cx += pos[k * 3];
+        cy += pos[k * 3 + 1];
+      }
+      cx /= n;
+      cy /= n;
+      let sc = 0;
+      let ss = 0;
+      for (let k = 0; k < n; k++) {
+        const px = pos[k * 3] - cx;
+        const py = pos[k * 3 + 1] - cy;
+        const qx = restXY[k * 2];
+        const qy = restXY[k * 2 + 1];
+        sc += qx * px + qy * py;
+        ss += qx * py - qy * px;
+      }
+      const a = Math.atan2(ss, sc);
+      return { cx, cy, cos: Math.cos(a), sin: Math.sin(a) };
+    }
+
+    // тянем за край: ковёр собирается у руки лишь немного, дальше едет и
+    // поворачивается целиком, как тяжёлый ковёр по полу
+    dragAlong() {
+      const { pos, prev, restXY, n } = this;
+      const pk = this.pinned;
+      const f = this.frame();
+      const gx = f.cx + restXY[pk * 2] * f.cos - restXY[pk * 2 + 1] * f.sin;
+      const gy = f.cy + restXY[pk * 2] * f.sin + restXY[pk * 2 + 1] * f.cos;
+      const ex = pos[pk * 3] - gx;
+      const ey = pos[pk * 3 + 1] - gy;
+      const el = Math.hypot(ex, ey);
+      // внутрь ковра уголок можно загнуть сильнее — чтобы подглядеть под него
+      const inward = ((f.cx - gx) * ex + (f.cy - gy) * ey) / (Math.hypot(f.cx - gx, f.cy - gy) * el || 1);
+      const slack = this.slack * (1 + 1.6 * Math.max(0, inward));
+      if (el > slack) {
+        const k = 1 - slack / el;
+        const jx = ex * k;
+        const jy = ey * k;
+        const rx = gx - f.cx;
+        const ry = gy - f.cy;
+        const ux = jx / (el * k);
+        const uy = jy / (el * k);
+        const arm = rx * uy - ry * ux;
+        const share = 1 / (1 + (arm * arm) / this.inertia);
+        const tx = jx * share;
+        const ty = jy * share;
+        const da = ((rx * ty - ry * tx) / this.inertia);
+        const c = Math.cos(da);
+        const s = Math.sin(da);
+        for (const arr of [pos, prev]) {
+          for (let q = 0; q < n; q++) {
+            if (q === pk) continue;
+            const x = arr[q * 3] - f.cx;
+            const y = arr[q * 3 + 1] - f.cy;
+            arr[q * 3] = f.cx + x * c - y * s + tx;
+            arr[q * 3 + 1] = f.cy + x * s + y * c + ty;
+          }
+        }
+      }
+      // пока держим — ковёр помнит, что он прямоугольный, и не перекашивается
+      const g = this.frame();
+      const alpha = 0.06;
+      for (let q = 0; q < n; q++) {
+        if (q === pk) continue;
+        const qx = restXY[q * 2];
+        const qy = restXY[q * 2 + 1];
+        pos[q * 3] += (g.cx + qx * g.cos - qy * g.sin - pos[q * 3]) * alpha;
+        pos[q * 3 + 1] += (g.cy + qx * g.sin + qy * g.cos - pos[q * 3 + 1]) * alpha;
+      }
     }
 
     noise() {
@@ -293,7 +371,6 @@
           pos[ob + 1] -= dy * f * wb;
           pos[ob + 2] -= dz * f * wb;
         }
-        if (this.lra) this.solveLRA();
         this.solveGround();
       }
       this.touch.fill(0);
@@ -313,7 +390,7 @@
         pos[o] = st[o] + dx * f;
         pos[o + 1] = st[o + 1] + dy * f;
       }
-      if (this.lra) this.solveLRA();
+      if (pk >= 0) this.dragAlong();
 
       // успокоение: после отпускания движение плавно затухает до полной остановки
       if (this.settle < 1) {
@@ -328,28 +405,6 @@
         if (mv > maxMove) maxMove = mv;
       }
       return maxMove;
-    }
-
-    solveLRA() {
-      const { pos, lra, n } = this;
-      const o = this.pinned * 3;
-      const px = pos[o];
-      const py = pos[o + 1];
-      const pz = pos[o + 2];
-      for (let k = 0; k < n; k++) {
-        const q = k * 3;
-        const dx = pos[q] - px;
-        const dy = pos[q + 1] - py;
-        const dz = pos[q + 2] - pz;
-        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        const r = lra[k] * 1.02;
-        if (d > r) {
-          const f = r / d;
-          pos[q] = px + dx * f;
-          pos[q + 1] = py + dy * f;
-          pos[q + 2] = pz + dz * f;
-        }
-      }
     }
 
     solveGround() {

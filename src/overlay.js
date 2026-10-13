@@ -12,6 +12,7 @@ const gl = canvas.getContext('webgl2', {
 const RUG_ASPECT = 1514 / 786;
 const EYE = 1800; // «высота камеры» для лёгкой перспективы
 const DT = 1 / 60;
+const PHYSICS_VERSION = 2;
 
 let view = { w: window.innerWidth, h: window.innerHeight };
 let dpr = window.devicePixelRatio || 1;
@@ -332,7 +333,8 @@ function createRug(spec) {
   const cloth = new Cloth({ width, height, nx, ny });
   const rug = { id: spec.id, width, cloth, active: false, still: 0, flatten: null, mesh: null };
   let restored = false;
-  if (spec.pos && spec.nx === nx && spec.ny === ny) {
+  // складки от старой физики (до версии 1.2) не восстанавливаем — ковёр ляжет ровно
+  if (spec.pos && spec.v === PHYSICS_VERSION && spec.nx === nx && spec.ny === ny) {
     try {
       const bin = atob(spec.pos);
       const bytes = new Uint8Array(bin.length);
@@ -387,6 +389,7 @@ function serialize(rug) {
     angle: Math.round((c.angle() * 180) / Math.PI),
     nx: c.nx,
     ny: c.ny,
+    v: PHYSICS_VERSION,
     pos: btoa(bin),
   };
 }
@@ -538,7 +541,7 @@ function setIgnore(v) {
 let grab = null; // { rug, mode: 'pull'|'move', last:[x,y], lift }
 
 function liftHeight(c) {
-  return Math.min(130, Math.max(40, c.height * 0.32));
+  return Math.min(55, Math.max(22, c.height * 0.14));
 }
 
 function toTop(rug) {
